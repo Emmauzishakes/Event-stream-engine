@@ -1,0 +1,13 @@
+# Compiled binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+main
+
+# Environment variables
+.env
+
+# OS files
+.DS_Store
