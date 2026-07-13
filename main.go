@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -48,8 +49,14 @@ type SignalingMessage struct {
 
 func main() {
 	http.HandleFunc("/ws", handleWebSocket)
-	fmt.Println("Live Go Streaming Engine running on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	fmt.Printf("Live Go Streaming Engine running on :%s\n", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
