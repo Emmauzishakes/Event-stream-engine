@@ -20,11 +20,13 @@ var upgrader = websocket.Upgrader{
 
 // 1. Upgraded EventRoom tracks Viewers and Likes
 type EventRoom struct {
-	VideoTrack  *webrtc.TrackLocalStaticRTP
-	AudioTrack  *webrtc.TrackLocalStaticRTP
-	Clients     map[*websocket.Conn]bool
-	ViewerCount int
-	TotalLikes  int
+	VideoTrack   *webrtc.TrackLocalStaticRTP
+	AudioTrack   *webrtc.TrackLocalStaticRTP
+	Clients      map[*websocket.Conn]bool
+	Broadcaster  *websocket.Conn
+	ViewerCount  int
+	TotalLikes   int
+	BlockedUsers map[string]bool
 	sync.RWMutex
 }
 
@@ -45,6 +47,9 @@ type SignalingMessage struct {
 	LikeCount   int                       `json:"like_count,omitempty"`   // Incoming batched likes
 	ViewerCount int                       `json:"viewer_count,omitempty"` // Outgoing stats
 	TotalLikes  int                       `json:"total_likes,omitempty"`  // Outgoing stats
+	Action      string                    `json:"action,omitempty"`
+	MessageID   string                    `json:"message_id,omitempty"`
+	Status      bool                      `json:"status,omitempty"`
 }
 
 func main() {
@@ -77,7 +82,20 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
+		ICEServers: []webrtc.ICEServer{
+			{
+				URLs: []string{"stun:stun.l.google.com:19302"},
+			},
+			{
+				URLs: []string{
+					"turn:openrelay.metered.ca:80",
+					"turn:openrelay.metered.ca:443",
+					"turn:openrelay.metered.ca:443?transport=tcp",
+				},
+				Username:   "openrelayproject",
+				Credential: "openrelayproject",
+			},
+		},
 	})
 	if err != nil {
 		return
@@ -110,6 +128,9 @@ func handleBroadcaster(conn *websocket.Conn, pc *webrtc.PeerConnection, sigMsg S
 			room = &EventRoom{}
 			rooms[sigMsg.EventSlug] = room
 		}
+
+		room.Broadcaster = conn
+
 		if track.Kind() == webrtc.RTPCodecTypeVideo {
 			room.VideoTrack = localTrack
 		} else if track.Kind() == webrtc.RTPCodecTypeAudio {
@@ -157,6 +178,33 @@ func handleBroadcaster(conn *websocket.Conn, pc *webrtc.PeerConnection, sigMsg S
 		if err := json.Unmarshal(msg, &update); err == nil {
 			if update.Candidate != nil {
 				pc.AddICECandidate(*update.Candidate)
+			}
+
+			if update.Type == "chat" || update.Type == "moderation" {
+				roomsLock.RLock()
+				room, exists := rooms[sigMsg.EventSlug]
+				roomsLock.RUnlock()
+
+				if exists {
+					if update.Type == "moderation" {
+						room.Lock()
+						if room.BlockedUsers == nil {
+							room.BlockedUsers = make(map[string]bool)
+						}
+						if update.Action == "block_user" {
+							room.BlockedUsers[update.User] = true
+						} else if update.Action == "unblock_user" {
+							room.BlockedUsers[update.User] = false
+						}
+						room.Unlock()
+					}
+
+					room.RLock()
+					for client := range room.Clients {
+						client.WriteJSON(update)
+					}
+					room.RUnlock()
+				}
 			}
 		}
 	}
@@ -254,8 +302,22 @@ func handleViewer(conn *websocket.Conn, pc *webrtc.PeerConnection, sigMsg Signal
 			// 6. Handle Chat
 			if update.Type == "chat" {
 				room.RLock()
+				isBlocked := false
+				if room.BlockedUsers != nil {
+					isBlocked = room.BlockedUsers[update.User]
+				}
+				room.RUnlock()
+
+				if isBlocked {
+					continue
+				}
+
+				room.RLock()
 				for client := range room.Clients {
 					client.WriteJSON(update)
+				}
+				if room.Broadcaster != nil {
+					room.Broadcaster.WriteJSON((update))
 				}
 				room.RUnlock()
 			}
@@ -277,6 +339,9 @@ func handleViewer(conn *websocket.Conn, pc *webrtc.PeerConnection, sigMsg Signal
 				likeMsg := SignalingMessage{Type: "stats", ViewerCount: newViewers, TotalLikes: newLikes}
 				for client := range room.Clients {
 					client.WriteJSON(likeMsg)
+				}
+				if room.Broadcaster != nil {
+					room.Broadcaster.WriteJSON((likeMsg))
 				}
 				room.RUnlock()
 			}
