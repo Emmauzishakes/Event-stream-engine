@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v3"
@@ -18,7 +19,7 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-// 1. Upgraded EventRoom tracks Viewers and Likes
+// 1. Upgraded EventRoom tracks Viewers, Likes, Tracks, Timer, and Chat History
 type EventRoom struct {
 	VideoTrack   *webrtc.TrackLocalStaticRTP
 	AudioTrack   *webrtc.TrackLocalStaticRTP
@@ -27,6 +28,8 @@ type EventRoom struct {
 	ViewerCount  int
 	TotalLikes   int
 	BlockedUsers map[string]bool
+	StartTime    int64
+	ChatHistory  []SignalingMessage
 	sync.RWMutex
 }
 
@@ -35,7 +38,20 @@ var (
 	rooms     = make(map[string]*EventRoom)
 )
 
-// 2. Upgraded SignalingMessage handles stats and batched likes
+// Helper method to safely append chat history under a write lock
+func (r *EventRoom) AddToChatHistory(msg SignalingMessage) {
+	if msg.User == "SYSTEM_COMMAND" {
+		return
+	}
+	r.Lock()
+	defer r.Unlock()
+	r.ChatHistory = append(r.ChatHistory, msg)
+	if len(r.ChatHistory) > 20 {
+		r.ChatHistory = r.ChatHistory[1:]
+	}
+}
+
+// 2. Upgraded SignalingMessage handles stats, timer, and chat history
 type SignalingMessage struct {
 	EventSlug   string                    `json:"event_slug"`
 	Type        string                    `json:"type"`
@@ -50,6 +66,8 @@ type SignalingMessage struct {
 	Action      string                    `json:"action,omitempty"`
 	MessageID   string                    `json:"message_id,omitempty"`
 	Status      bool                      `json:"status,omitempty"`
+	StartedAt   int64                     `json:"started_at,omitempty"`
+	ChatHistory []SignalingMessage        `json:"chat_history,omitempty"`
 }
 
 func main() {
@@ -81,7 +99,16 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{
+	// 1. Lock Pion to the exact UDP port range allowed by AWS EC2 Security Group
+	settingEngine := webrtc.SettingEngine{}
+	if err := settingEngine.SetEphemeralUDPPortRange(10000, 50000); err != nil {
+		log.Printf("⚠️ Error setting UDP port range: %v", err)
+	}
+
+	// 2. Instantiate custom API with setting engine
+	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
+
+	peerConnection, err := api.NewPeerConnection(webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
 				URLs: []string{"stun:stun.l.google.com:19302"},
@@ -125,7 +152,12 @@ func handleBroadcaster(conn *websocket.Conn, pc *webrtc.PeerConnection, sigMsg S
 		roomsLock.Lock()
 		room, exists := rooms[sigMsg.EventSlug]
 		if !exists {
-			room = &EventRoom{}
+			room = &EventRoom{
+				StartTime:    time.Now().UnixMilli(),
+				ChatHistory:  make([]SignalingMessage, 0, 20),
+				Clients:      make(map[*websocket.Conn]bool),
+				BlockedUsers: make(map[string]bool),
+			}
 			rooms[sigMsg.EventSlug] = room
 		}
 
@@ -136,7 +168,17 @@ func handleBroadcaster(conn *websocket.Conn, pc *webrtc.PeerConnection, sigMsg S
 		} else if track.Kind() == webrtc.RTPCodecTypeAudio {
 			room.AudioTrack = localTrack
 		}
+
+		statsMsg := SignalingMessage{
+			Type:        "stats",
+			StartedAt:   room.StartTime,
+			ViewerCount: room.ViewerCount,
+			TotalLikes:  room.TotalLikes,
+			ChatHistory: room.ChatHistory,
+		}
 		roomsLock.Unlock()
+
+		conn.WriteJSON(statsMsg)
 
 		go func() {
 			rtpBuf := make([]byte, 1400)
@@ -186,7 +228,12 @@ func handleBroadcaster(conn *websocket.Conn, pc *webrtc.PeerConnection, sigMsg S
 				roomsLock.RUnlock()
 
 				if exists {
+					if update.Type == "chat" {
+						room.AddToChatHistory(update)
+					}
+
 					if update.Type == "moderation" {
+						room.AddToChatHistory(update)
 						room.Lock()
 						if room.BlockedUsers == nil {
 							room.BlockedUsers = make(map[string]bool)
@@ -246,7 +293,7 @@ func handleViewer(conn *websocket.Conn, pc *webrtc.PeerConnection, sigMsg Signal
 		}
 	})
 
-	// 3. Register client and update Viewer Count
+	// Register client and update Viewer Count
 	room.Lock()
 	if room.Clients == nil {
 		room.Clients = make(map[*websocket.Conn]bool)
@@ -255,10 +302,20 @@ func handleViewer(conn *websocket.Conn, pc *webrtc.PeerConnection, sigMsg Signal
 	room.ViewerCount++
 	currentViewers := room.ViewerCount
 	currentLikes := room.TotalLikes
+	startedAt := room.StartTime
+
+	chatHistory := make([]SignalingMessage, len(room.ChatHistory))
+	copy(chatHistory, room.ChatHistory)
 	room.Unlock()
 
-	// 4. Send initial state to the new viewer, and broadcast new viewer count to everyone
-	statsMsg := SignalingMessage{Type: "stats", ViewerCount: currentViewers, TotalLikes: currentLikes}
+	// Send initial state to the new viewer, and broadcast new viewer count to everyone
+	statsMsg := SignalingMessage{
+		Type:        "stats",
+		ViewerCount: currentViewers,
+		TotalLikes:  currentLikes,
+		StartedAt:   startedAt,
+		ChatHistory: chatHistory,
+	}
 	conn.WriteJSON(statsMsg)
 
 	room.RLock()
@@ -269,7 +326,7 @@ func handleViewer(conn *websocket.Conn, pc *webrtc.PeerConnection, sigMsg Signal
 	}
 	room.RUnlock()
 
-	// 5. Unregister client on disconnect
+	// Unregister client on disconnect
 	defer func() {
 		room.Lock()
 		delete(room.Clients, conn)
@@ -299,8 +356,10 @@ func handleViewer(conn *websocket.Conn, pc *webrtc.PeerConnection, sigMsg Signal
 				pc.AddICECandidate(*update.Candidate)
 			}
 
-			// 6. Handle Chat
+			// Handle Chat
 			if update.Type == "chat" {
+				room.AddToChatHistory(update)
+
 				room.RLock()
 				isBlocked := false
 				if room.BlockedUsers != nil {
@@ -317,12 +376,12 @@ func handleViewer(conn *websocket.Conn, pc *webrtc.PeerConnection, sigMsg Signal
 					client.WriteJSON(update)
 				}
 				if room.Broadcaster != nil {
-					room.Broadcaster.WriteJSON((update))
+					room.Broadcaster.WriteJSON(update)
 				}
 				room.RUnlock()
 			}
 
-			// 7. Handle Batched Likes
+			// Handle Batched Likes
 			if update.Type == "like" {
 				room.Lock()
 				if update.LikeCount > 0 {
@@ -341,7 +400,7 @@ func handleViewer(conn *websocket.Conn, pc *webrtc.PeerConnection, sigMsg Signal
 					client.WriteJSON(likeMsg)
 				}
 				if room.Broadcaster != nil {
-					room.Broadcaster.WriteJSON((likeMsg))
+					room.Broadcaster.WriteJSON(likeMsg)
 				}
 				room.RUnlock()
 			}
