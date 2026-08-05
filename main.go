@@ -150,6 +150,12 @@ func handleBroadcaster(conn *websocket.Conn, pc *webrtc.PeerConnection, sigMsg S
 	log.Printf("📹 Broadcaster connected for event: %s", sigMsg.EventSlug)
 
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		log.Printf(
+			"TRACK RECEIVED kind=%s codec=%s id=%s",
+			track.Kind().String(),
+			track.Codec().MimeType,
+			track.ID(),
+		)
 		localTrack, err := webrtc.NewTrackLocalStaticRTP(track.Codec().RTPCodecCapability, track.ID(), track.StreamID())
 		if err != nil {
 			return
