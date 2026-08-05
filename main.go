@@ -130,6 +130,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 	})
+
+	peerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		log.Printf("ICE Connection State: %s", state.String())
+	})
+
+	peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		log.Printf("Peer Connection State: %s", state.String())
+	})
+
 	if err != nil {
 		return
 	}
