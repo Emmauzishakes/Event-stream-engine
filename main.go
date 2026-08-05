@@ -105,6 +105,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Printf("⚠️ Error setting UDP port range: %v", err)
 	}
 
+	// Replace "YOUR_EC2_PUBLIC_IP" with your actual public IP (or load via os.Getenv("EC2_PUBLIC_IP"))
+	ec2PublicIP := os.Getenv("EC2_PUBLIC_IP") 
+	if ec2PublicIP != "" {
+		settingEngine.SetNAT1To1IPs([]string{ec2PublicIP}, webrtc.ICECandidateTypeHost)
+	}
+
 	// 2. Instantiate custom API with setting engine
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
 
