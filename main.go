@@ -106,9 +106,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Replace "YOUR_EC2_PUBLIC_IP" with your actual public IP (or load via os.Getenv("EC2_PUBLIC_IP"))
-	ec2PublicIP := os.Getenv("EC2_PUBLIC_IP") 
+	ec2PublicIP := os.Getenv("EC2_PUBLIC_IP")
+	// ec2PublicIP := os.Getenv("16.28.111.136")
+	log.Printf("EC2_PUBLIC_IP=%s", ec2PublicIP)
 	if ec2PublicIP != "" {
 		settingEngine.SetNAT1To1IPs([]string{ec2PublicIP}, webrtc.ICECandidateTypeHost)
+		log.Printf("Using NAT1To1 IP mapping: %s", ec2PublicIP)
 	}
 
 	// 2. Instantiate custom API with setting engine
@@ -225,10 +228,23 @@ func handleBroadcaster(conn *websocket.Conn, pc *webrtc.PeerConnection, sigMsg S
 	pc.SetLocalDescription(answer)
 	conn.WriteJSON(answer)
 
+
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
-		if c != nil {
-			conn.WriteJSON(map[string]interface{}{"candidate": c.ToJSON()})
-		}
+    		if c == nil {
+        		log.Println("ICE gathering complete")
+        		return
+    		}
+
+    		log.Printf(
+        		"LOCAL ICE CANDIDATE: %s",
+        		c.ToJSON().Candidate,
+    		)
+
+    		if err := conn.WriteJSON(map[string]interface{}{
+        		"candidate": c.ToJSON(),
+   	 	}); err != nil {
+        		log.Printf("failed to send candidate: %v", err)
+    		}
 	})
 
 	// CONTINUOUS LISTENING LOOP
